@@ -10,6 +10,7 @@ import ssl
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from aiomqtt import MqttError
 
 from actron_neo_api.models import ActronAirStatus
 from actron_neo_api.rt import (
@@ -1321,3 +1322,125 @@ class TestMQTTPayloadDiagnostics:
 
         assert len(seen) == 1
         assert seen[0].payload == {"RemoteZoneInfo": [{"NV_Title": "Kurt's Office"}]}
+
+
+class TestNeoGetAllOnConnect:
+    """The Neo app sends getAll on every connect; so do we."""
+
+    @staticmethod
+    def _client() -> MQTTRTClient:
+        return MQTTRTClient(
+            RealtimeConnectionDetails(
+                endpoint="mqtt.example.com",
+                port=8883,
+                protocol="ssl",
+                user_id="user-1",
+            ),
+            user_email="test@example.com",
+            access_token="token-123",
+            client_id="entry-1",
+        )
+
+    def test_build_command_topic(self) -> None:
+        """The command topic must match the one the Neo app publishes to."""
+        assert (
+            MQTTRTClient.build_command_topic("user-1", "ABC123")
+            == "actron-cloud/user-1/neo/abc123/app/cmd"
+        )
+
+    def test_build_command_topic_validates_inputs(self) -> None:
+        """Empty identifiers are rejected rather than producing a malformed topic."""
+        with pytest.raises(ValueError, match="user_id cannot be empty"):
+            MQTTRTClient.build_command_topic(" ", "abc123")
+        with pytest.raises(ValueError, match="device_serial cannot be empty"):
+            MQTTRTClient.build_command_topic("user-1", " ")
+
+    @pytest.mark.asyncio
+    async def test_request_full_status_publishes_the_app_payload(self) -> None:
+        """The published command must match what the Neo app sends."""
+        client = self._client()
+        broker = _FakeMQTTClient()
+        client._client = broker  # noqa: SLF001
+
+        assert await client.request_full_status("ABC123") is True
+
+        topic, raw = broker.published[0]
+        assert topic == "actron-cloud/user-1/neo/abc123/app/cmd"
+        payload = json.loads(raw)
+        assert payload["command"] == {"type": "getAll"}
+        assert payload["OptOutOfLogging"] is False
+        # The response is routed by the correlation id's prefix.
+        assert payload["correlationId"].startswith("entry-1/")
+
+    @pytest.mark.asyncio
+    async def test_request_full_status_is_a_no_op_while_disconnected(self) -> None:
+        """Without a broker connection there is nothing to publish to."""
+        client = self._client()
+
+        assert await client.request_full_status("abc123") is False
+
+    @pytest.mark.asyncio
+    async def test_request_full_status_validates_serial(self) -> None:
+        """An empty serial is a caller error, not a transport failure."""
+        client = self._client()
+
+        with pytest.raises(ValueError, match="device_serial cannot be empty"):
+            await client.request_full_status("  ")
+
+    @pytest.mark.asyncio
+    async def test_request_full_status_survives_a_broker_failure(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A rejected command must not break push; the device just self-reports."""
+        client = self._client()
+
+        class _BrokenBroker(_FakeMQTTClient):
+            async def publish(self, topic: str, payload: bytes) -> None:
+                raise MqttError("rejected")
+
+        client._client = _BrokenBroker()  # noqa: SLF001
+
+        with caplog.at_level(logging.DEBUG, logger="actron_neo_api.rt.mqtt_client"):
+            assert await client.request_full_status("abc123") is False
+
+        assert "Failed to request full status" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_subscribe_system_requests_a_full_status(self) -> None:
+        """Subscribing must not leave the caller waiting for the next broadcast."""
+        client = self._client()
+        broker = _FakeMQTTClient()
+        client._client = broker  # noqa: SLF001
+
+        await client.subscribe_system("abc123")
+
+        assert client._subscribed_systems == {"abc123"}  # noqa: SLF001
+        assert [topic for topic, _ in broker.published] == [
+            "actron-cloud/user-1/neo/abc123/app/cmd"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_unsubscribe_system_stops_tracking_it(self) -> None:
+        """A removed system must not be re-requested after a reconnect."""
+        client = self._client()
+        client._client = _FakeMQTTClient()  # noqa: SLF001
+
+        await client.subscribe_system("abc123")
+        await client.unsubscribe_system("abc123")
+
+        assert client._subscribed_systems == set()  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_reconnect_re_requests_every_subscribed_system(self) -> None:
+        """The app resets its flag on disconnect, so a reconnect asks again."""
+        client = self._client()
+        broker = _FakeMQTTClient()
+        client._client = broker  # noqa: SLF001
+        client._subscribed_systems = {"abc123", "def456"}  # noqa: SLF001
+
+        await client._request_full_status_for_all()  # noqa: SLF001
+
+        assert [topic for topic, _ in broker.published] == [
+            "actron-cloud/user-1/neo/abc123/app/cmd",
+            "actron-cloud/user-1/neo/def456/app/cmd",
+        ]

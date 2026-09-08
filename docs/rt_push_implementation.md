@@ -104,6 +104,20 @@ without ever resuming one, so the two settings are chosen together.
 Use an identifier that is unique per installation. Two clients connecting with
 the same identifier will repeatedly disconnect each other.
 
+## Initial State On Connect (Neo)
+
+A Neo device broadcasts its complete state roughly every fifteen minutes on its
+own, so a newly connected client would otherwise hold stale state for that long.
+To avoid it, the MQTT transport sends the same `getAll` command the Neo app
+sends, on the device's `app/cmd` topic, which prompts an immediate
+`full-status-broadcast`.
+
+It is sent when a system is subscribed and again for each subscribed system
+after a reconnect, matching the app's once-per-connection behaviour. `start_push()`
+does not wait for the response — the command only makes the push snapshot arrive
+promptly, and a caller's initial state still comes from its own first fetch. If
+the command fails, push continues and the device reports on its own schedule.
+
 ## Event Buffering
 
 Each transport keeps a bounded buffer of recent events for `iter_events()`

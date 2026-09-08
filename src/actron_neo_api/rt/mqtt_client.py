@@ -43,6 +43,8 @@ _MQTT_TOPIC_HEART_BEAT = "mwc/heart-beat"
 _MQTT_TOPIC_FULL_STATUS = "mwc/full-status"
 _MQTT_TOPIC_CMD_RESPONSE = "mwc/cmd-response"
 _MQTT_TOPIC_STATUS_CHANGE = "mwc/status-change"
+_MQTT_TOPIC_APP_COMMAND = "app/cmd"
+_MQTT_COMMAND_GET_ALL = "getAll"
 _MQTT_DEFAULT_KEEPALIVE = 60
 _MQTT_DEFAULT_RECONNECT_DELAY = 0.5
 _MQTT_MAX_RECONNECT_DELAY = 60.0
@@ -149,6 +151,7 @@ class MQTTRTClient:
         self._connected_event = asyncio.Event()
         self._connection_state = RealtimeConnectionState.DISCONNECTED
         self._subscriptions: set[str] = set()
+        self._subscribed_systems: set[str] = set()
         self._callbacks: list[Callable[[RealtimeEvent], Awaitable[None] | None]] = []
         self._event_queue: asyncio.Queue[RealtimeEvent] = new_event_queue(event_queue_maxsize)
         self._last_error: Exception | None = None
@@ -193,6 +196,20 @@ class MQTTRTClient:
             full_status=f"{base}/{_MQTT_TOPIC_FULL_STATUS}",
             cmd_response=f"{base}/{_MQTT_TOPIC_CMD_RESPONSE}/{machine_segment}/+",
             status_change=f"{base}/{_MQTT_TOPIC_STATUS_CHANGE}",
+        )
+
+    @staticmethod
+    def build_command_topic(user_id: str, device_serial: str) -> str:
+        """Build the topic a Neo device accepts app commands on."""
+        if not user_id.strip():
+            raise ValueError("user_id cannot be empty")
+        if not device_serial.strip():
+            raise ValueError("device_serial cannot be empty")
+
+        serial = device_serial.lower()
+        return (
+            f"{_MQTT_TOPIC_PREFIX}/{user_id}/{_MQTT_PLATFORM_SEGMENT}/{serial}"
+            f"/{_MQTT_TOPIC_APP_COMMAND}"
         )
 
     def register_callback(
@@ -272,7 +289,43 @@ class MQTTRTClient:
         await self.subscribe(topics.full_status)
         await self.subscribe(topics.cmd_response)
         await self.subscribe(topics.status_change)
+        self._subscribed_systems.add(device_serial.lower())
+        await self.request_full_status(device_serial)
         return topics
+
+    async def request_full_status(self, device_serial: str) -> bool:
+        """Ask a device to broadcast its complete state immediately.
+
+        A Neo device publishes a full status roughly every fifteen minutes on
+        its own, so a new connection would otherwise hold stale state for that
+        long. The Neo app avoids this by sending a ``getAll`` command on every
+        connect, which is what this reproduces.
+
+        Returns:
+            True if the command was published, False if the transport was not
+            connected or the broker rejected it. A failure is not fatal: push
+            keeps working, the device just reports on its own schedule.
+        """
+        if not device_serial.strip():
+            raise ValueError("device_serial cannot be empty")
+        if self._client is None:
+            return False
+
+        topic = self.build_command_topic(self._details.user_id, device_serial)
+        payload = {
+            "command": {"type": _MQTT_COMMAND_GET_ALL},
+            # The response is routed back on a cmd-response topic scoped to the
+            # correlation id's prefix, which the client identifier supplies so
+            # a command stays attributable to this connection.
+            "correlationId": f"{self._client_id}/{uuid.uuid4()}",
+            "OptOutOfLogging": False,
+        }
+        try:
+            await self.publish(topic, payload)
+        except (MqttError, OSError, RuntimeError) as exc:
+            _LOGGER.debug("Failed to request full status for %s: %s", device_serial, exc)
+            return False
+        return True
 
     async def unsubscribe_system(
         self,
@@ -285,6 +338,7 @@ class MQTTRTClient:
         await self.unsubscribe(topics.full_status)
         await self.unsubscribe(topics.cmd_response)
         await self.unsubscribe(topics.status_change)
+        self._subscribed_systems.discard(device_serial.lower())
 
     async def update_access_token(self, access_token: str) -> None:
         """Update the MQTT password and trigger a reconnect."""
@@ -321,6 +375,7 @@ class MQTTRTClient:
                     await self._set_state(RealtimeConnectionState.CONNECTED)
                     self._connected_event.set()
                     retry_delay = self._reconnect_initial_delay
+                    await self._request_full_status_for_all()
 
                     async for message in client.messages:
                         if not self._running:
@@ -385,6 +440,16 @@ class MQTTRTClient:
         except ValueError:
             return False
         return True
+
+    async def _request_full_status_for_all(self) -> None:
+        """Re-request a full status for every subscribed system after a connect.
+
+        The initial request is made by :meth:`subscribe_system`; this covers
+        reconnects, where the set is already populated and the device would
+        otherwise not report until its next scheduled broadcast.
+        """
+        for serial in sorted(self._subscribed_systems):
+            await self.request_full_status(serial)
 
     async def _restore_subscriptions(self, client: Client) -> None:
         """Resubscribe to all known topics after a reconnect."""
