@@ -30,6 +30,7 @@ from .base import (
     RealtimeEventKind,
     RealtimeMessage,
     RealtimeTransportType,
+    loads_repairing_escapes,
     new_event_queue,
     put_event_dropping_oldest,
 )
@@ -47,6 +48,13 @@ _MQTT_DEFAULT_RECONNECT_DELAY = 0.5
 _MQTT_MAX_RECONNECT_DELAY = 60.0
 _MQTT_CLIENT_ID_PREFIX = "HA_"
 _MQTT_UNKNOWN_USERNAME = "unknown"
+_JSON_ERROR_CONTEXT_CHARS = 40
+
+
+def _json_failure_context(exc: json.JSONDecodeError) -> str:
+    """Return the payload text surrounding a JSON parse failure."""
+    start = max(0, exc.pos - _JSON_ERROR_CONTEXT_CHARS)
+    return repr(exc.doc[start : exc.pos + _JSON_ERROR_CONTEXT_CHARS])
 
 
 @dataclass(frozen=True, slots=True)
@@ -387,7 +395,19 @@ class MQTTRTClient:
         """Decode a raw MQTT message and forward it to the event queue."""
         try:
             payload = self._decode_payload(raw_payload)
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        except json.JSONDecodeError as exc:
+            # The offending fragment identifies the defect (an unescaped
+            # backslash in a name, say) without reproducing the payload; the
+            # surrounding text can carry user data, so it stays at debug.
+            _LOGGER.warning(
+                "Failed to decode MQTT payload on %s: %s (offending fragment: %r)",
+                topic,
+                exc,
+                exc.doc[exc.pos : exc.pos + 2],
+            )
+            _LOGGER.debug("Payload around the failure: %s", _json_failure_context(exc))
+            return
+        except (UnicodeDecodeError, ValueError) as exc:
             _LOGGER.warning("Failed to decode MQTT payload on %s: %s", topic, exc)
             return
 
@@ -418,7 +438,7 @@ class MQTTRTClient:
     def _decode_payload(raw_payload: bytes) -> dict[str, Any]:
         """Decode an MQTT payload into a JSON object."""
         decoded = raw_payload.decode("utf-8")
-        payload = json.loads(decoded)
+        payload = loads_repairing_escapes(decoded)
         if not isinstance(payload, dict):
             raise ValueError("MQTT payload must decode to a JSON object")
         return payload

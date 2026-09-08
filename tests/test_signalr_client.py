@@ -1026,3 +1026,29 @@ async def test_run_supervisor_reports_transport_errors_without_traceback(
     # Routine drops are debug-level; ERROR is reserved for the unexpected.
     assert "SignalR reconnecting after error" in caplog.text
     assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+
+
+@pytest.mark.asyncio
+async def test_sse_payload_with_escaped_apostrophe_is_parsed() -> None:
+    r"""The SSE parser tolerates the same invalid ``\'`` escape as MQTT."""
+    client = SignalRRTClient(_details(), access_token="secret")
+    session = _Session(
+        post_responses=[_Response(status=200, json_data={"url": "https://example.test/sse"})],
+        get_responses=[
+            _Response(
+                status=200,
+                content_items=[b'data: {"NV_Title":"Kurt\\\'s Office"}\n', b"\n"],
+            )
+        ],
+    )
+    client._session = session  # type: ignore[assignment]
+    client._running = True
+    seen: list[RealtimeEvent] = []
+    client.register_callback(seen.append)
+
+    await client._connect_and_listen()
+    await asyncio.sleep(0)
+
+    assert [ev.payload for ev in seen if isinstance(ev, RealtimeMessage)] == [
+        {"NV_Title": "Kurt's Office"}
+    ]

@@ -8,7 +8,9 @@ surface.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
@@ -16,6 +18,12 @@ from typing import Any, Protocol, runtime_checkable
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_EVENT_QUEUE_MAXSIZE = 256
+
+# A valid JSON escape, or an apostrophe escape that JSON does not allow. The
+# valid alternative is listed first so it consumes both characters of a "\\"
+# pair, which keeps a legitimately escaped backslash before an apostrophe from
+# being misread as an invalid escape.
+_ESCAPE_SEQUENCE = re.compile(r"""\\(?:u[0-9a-fA-F]{4}|["\\/bfnrtu])|\\'""")
 
 
 class RealtimeTransportType(str, Enum):
@@ -103,6 +111,44 @@ class RealtimeConnectionDetails:
     def scheme(self) -> str:
         """Return the transport URI scheme."""
         return "ssl" if self.uses_tls else "tcp"
+
+
+def repair_apostrophe_escapes(text: str) -> str:
+    r"""Rewrite JavaScript-style ``\'`` escapes as plain apostrophes.
+
+    The Actron cloud escapes apostrophes inside string values, which JSON does
+    not permit: RFC 8259 allows only ``" \ / b f n r t`` and ``uXXXX`` after a
+    backslash, and an apostrophe needs no escaping at all. A zone named
+    "Kurt's Office" therefore makes the whole payload unparseable. The escaping
+    follows ``addslashes`` semantics, where ``\'`` denotes a literal
+    apostrophe, so that is what it is restored to.
+    """
+
+    def _replace(match: re.Match[str]) -> str:
+        # Valid escapes are matched only so they are stepped over intact.
+        return "'" if match.group(0) == "\\'" else match.group(0)
+
+    return _ESCAPE_SEQUENCE.sub(_replace, text)
+
+
+def loads_repairing_escapes(text: str) -> Any:
+    """Parse JSON, retrying once with the vendor's invalid escapes corrected.
+
+    A well-formed payload is parsed strictly and never inspected further; the
+    repair runs only after a failure. If the payload is still unparseable
+    afterwards, that second failure is what propagates: it points at the defect
+    that remains, whereas the original error points at an apostrophe escape
+    this function has already dealt with.
+    """
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        repaired = repair_apostrophe_escapes(text)
+        if repaired == text:
+            raise
+    payload = json.loads(repaired)
+    _LOGGER.debug("Parsed a payload containing invalid apostrophe escapes")
+    return payload
 
 
 def new_event_queue(

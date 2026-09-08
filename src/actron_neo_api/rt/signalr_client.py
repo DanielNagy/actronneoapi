@@ -14,7 +14,6 @@ and mapping incoming payloads to shared domain models.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 from urllib.parse import quote
@@ -31,6 +30,7 @@ from .base import (
     RealtimeEventKind,
     RealtimeMessage,
     RealtimeTransportType,
+    loads_repairing_escapes,
     new_event_queue,
     put_event_dropping_oldest,
 )
@@ -309,7 +309,7 @@ class SignalRRTClient(RealtimeClient):
                     elif line.strip() == "":
                         if buffer:
                             try:
-                                payload = json.loads(buffer)
+                                payload = loads_repairing_escapes(buffer)
                             except Exception:
                                 _LOGGER.debug("invalid sse json: %s", buffer)
                             else:

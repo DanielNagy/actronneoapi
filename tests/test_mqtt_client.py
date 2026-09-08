@@ -1244,3 +1244,80 @@ class TestMQTTRealtimeDispatch:
         assert captured[0]["clean_session"] is True
         assert captured[1]["clean_session"] is False
         assert captured[1]["identifier"] == "config-entry-1"
+
+
+class TestMQTTPayloadDiagnostics:
+    """A malformed payload has to say enough to be diagnosed at the source."""
+
+    @staticmethod
+    def _client() -> MQTTRTClient:
+        return MQTTRTClient(
+            RealtimeConnectionDetails(
+                endpoint="mqtt.example.com",
+                port=8883,
+                protocol="ssl",
+                user_id="user-1",
+            ),
+            user_email="test@example.com",
+            access_token="token-123",
+        )
+
+    @pytest.mark.asyncio
+    async def test_invalid_escape_reports_the_offending_fragment(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An unescaped backslash must be identifiable from the log alone."""
+        client = self._client()
+        payload = b'{"NameUserdefined":"Kids\\Play","enabled":true}'
+
+        with caplog.at_level(logging.DEBUG, logger="actron_neo_api.rt.mqtt_client"):
+            await client._handle_message(  # noqa: SLF001
+                "actron-cloud/user-1/neo/abc123/mwc/full-status",
+                payload,
+            )
+
+        assert "offending fragment: '\\\\P'" in caplog.text
+        # The surrounding text names the field, and stays at debug.
+        debug_text = "\n".join(
+            record.message for record in caplog.records if record.levelno == logging.DEBUG
+        )
+        assert "NameUserdefined" in debug_text
+        assert "NameUserdefined" not in "\n".join(
+            record.message for record in caplog.records if record.levelno >= logging.WARNING
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_json_failure_still_reports_plainly(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A payload that is valid JSON but not an object has no fragment to show."""
+        client = self._client()
+
+        with caplog.at_level(logging.WARNING):
+            await client._handle_message(  # noqa: SLF001
+                "actron-cloud/user-1/neo/abc123/mwc/full-status",
+                b"[1, 2, 3]",
+            )
+
+        assert "MQTT payload must decode to a JSON object" in caplog.text
+        assert "offending fragment" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_apostrophe_in_a_zone_title_is_not_dropped(self) -> None:
+        r"""A payload the cloud escapes as ``\'`` must still reach subscribers.
+
+        The Actron cloud escapes apostrophes inside string values, which JSON
+        forbids. A zone named "Kurt's Office" made every full-status for that
+        account unparseable, so the whole snapshot was discarded.
+        """
+        client = self._client()
+        seen: list[RealtimeMessage] = []
+        client.register_callback(seen.append)  # type: ignore[arg-type]
+
+        await client._handle_message(  # noqa: SLF001
+            "actron-cloud/user-1/neo/abc123/mwc/full-status",
+            b'{"RemoteZoneInfo":[{"NV_Title":"Kurt\\\'s Office"}]}',
+        )
+
+        assert len(seen) == 1
+        assert seen[0].payload == {"RemoteZoneInfo": [{"NV_Title": "Kurt's Office"}]}
