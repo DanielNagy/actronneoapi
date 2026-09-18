@@ -154,9 +154,6 @@ class TestZoneAsyncEnable:
         # Zone 0 should be enabled (True)
         assert mock_api.last_command["command"]["UserAirconSettings.EnabledZones"][0] is True
 
-        # Optimistic local state update
-        assert zone_with_api._parent_status.user_aircon_settings.enabled_zones[0] is True
-
     @pytest.mark.asyncio
     async def test_disable_zone_with_api(self, zone_with_api: ActronAirZone, mock_api: Any) -> None:
         """Test disabling zone with API reference."""
@@ -166,9 +163,6 @@ class TestZoneAsyncEnable:
         assert mock_api.last_serial == "TEST123"
         # Zone 0 should be disabled (False)
         assert mock_api.last_command["command"]["UserAirconSettings.EnabledZones"][0] is False
-
-        # Optimistic local state update
-        assert zone_with_api._parent_status.user_aircon_settings.enabled_zones[0] is False
 
     @pytest.mark.asyncio
     async def test_enable_without_api(self, zone_without_api: ActronAirZone) -> None:

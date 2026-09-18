@@ -406,9 +406,8 @@ class ActronAirZone(BaseModel):
     async def enable(self, is_enabled: bool = True) -> None:
         """Enable or disable this zone and send the command.
 
-        After successful command delivery the local ``enabled_zones`` list is
-        updated optimistically so that subsequent reads reflect the change
-        before the next status poll.
+        The API updates local zone state from the delivered command, including
+        changes merged from concurrent callers, before this method returns.
 
         Args:
             is_enabled: True to enable, False to disable
@@ -417,10 +416,5 @@ class ActronAirZone(BaseModel):
         command = self._set_enable_command(is_enabled)
         if self.parent_status.api and self.parent_status.serial_number:
             await self.parent_status.api.send_command(self.parent_status.serial_number, command)
-
-            # Optimistic local state update — apply the exact EnabledZones sent
-            sent_zones = command.get("command", {}).get("UserAirconSettings.EnabledZones")
-            if isinstance(sent_zones, list):
-                self.parent_status.user_aircon_settings.enabled_zones = list(sent_zones)
         else:
             raise ValueError("No API reference available to send command")

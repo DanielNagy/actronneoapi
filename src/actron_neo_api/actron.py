@@ -1507,6 +1507,19 @@ class ActronAirAPI:
             headers={"Content-Type": "application/json"},
         )
 
+        inner = command.get("command", {})
+        sent_zones = inner.get("UserAirconSettings.EnabledZones")
+        if inner.get("type") == "set-settings" and isinstance(sent_zones, list):
+            # Status may have been replaced while awaiting command delivery.
+            status = self.state_manager.get_status(serial_number)
+            if status is not None:
+                status.user_aircon_settings.enabled_zones = list(sent_zones)
+                raw_settings = status.last_known_state.get("UserAirconSettings")
+                if not isinstance(raw_settings, dict):
+                    raw_settings = {}
+                    status.last_known_state["UserAirconSettings"] = raw_settings
+                raw_settings["EnabledZones"] = list(sent_zones)
+
     async def update_status(
         self, serial_number: str | None = None
     ) -> dict[str, ActronAirStatus | None]:
