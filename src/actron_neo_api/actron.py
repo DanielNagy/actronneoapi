@@ -53,18 +53,12 @@ _FLAT_KEY_SEGMENT_RE = re.compile(r"([^.\[\]]+)|\[(\d+)\]")
 class _PendingBatch:
     """A batch of set-settings commands being coalesced for a single system."""
 
-    __slots__ = ("merged_command", "baseline_zones", "zone_overrides", "futures", "timer")
+    __slots__ = ("merged_command", "zone_replacement", "zone_overrides", "futures", "timer")
 
-    def __init__(self, baseline_zones: list[bool] | None) -> None:
-        """Initialise a pending batch.
-
-        Args:
-            baseline_zones: Current enabled-zones snapshot (for element-wise merging),
-                or None if unavailable.
-
-        """
+    def __init__(self) -> None:
+        """Initialise a pending batch."""
         self.merged_command: dict[str, Any] = {"type": "set-settings"}
-        self.baseline_zones = baseline_zones
+        self.zone_replacement: list[bool] | None = None
         self.zone_overrides: dict[int, bool] = {}
         self.futures: list[asyncio.Future[None]] = []
         self.timer: asyncio.TimerHandle | None = None
@@ -75,8 +69,9 @@ class CommandCoalescer:
 
     When multiple zone-enable or other set-settings commands arrive within
     ``debounce_seconds``, they are deep-merged into a single API call.
-    ``EnabledZones`` lists are merged element-wise against the current state
-    so concurrent zone toggles don't overwrite each other.
+    Zone models supply explicit per-index changes with last-request-wins semantics.
+    Full ``EnabledZones`` lists replace earlier zone intent in the batch.
+    Zone-bearing payloads are built and delivered under a per-system lock.
     """
 
     def __init__(
@@ -100,6 +95,7 @@ class CommandCoalescer:
         self._debounce = debounce_seconds
         self._batches: dict[str, _PendingBatch] = {}
         self._pending_tasks: set[asyncio.Task[None]] = set()
+        self._zone_locks: dict[str, asyncio.Lock] = {}
 
     @property
     def debounce_seconds(self) -> float:
@@ -136,11 +132,28 @@ class CommandCoalescer:
             ActronAirAPIError: If the eventual API call fails.
 
         """
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[None] = loop.create_future()
-
         batch = self._get_or_create_batch(serial_number)
         self._merge_into_batch(batch, command)
+        await self._schedule_batch(serial_number, batch)
+
+    async def enqueue_zone_changes(self, serial_number: str, changes: dict[int, bool]) -> None:
+        """Enqueue explicit per-zone intent using last-request-wins ordering.
+
+        Cancelling a waiting caller does not withdraw its accepted command.
+
+        Args:
+            serial_number: Target system serial number.
+            changes: Explicit zone indices and requested enabled states.
+
+        """
+        batch = self._get_or_create_batch(serial_number)
+        batch.zone_overrides.update(changes)
+        await self._schedule_batch(serial_number, batch)
+
+    def _schedule_batch(self, serial_number: str, batch: _PendingBatch) -> asyncio.Future[None]:
+        """Schedule delivery and return this caller's completion future."""
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[None] = loop.create_future()
         batch.futures.append(future)
 
         # Reset the debounce timer
@@ -148,14 +161,19 @@ class CommandCoalescer:
             batch.timer.cancel()
 
         def _schedule_flush(sn: str = serial_number) -> None:
-            task = asyncio.ensure_future(self._flush(sn))
+            task = asyncio.ensure_future(
+                self._flush(sn) if self._debounce > 0 else self._flush_batch(sn, batch)
+            )
             self._pending_tasks.add(task)
             task.add_done_callback(self._pending_tasks.discard)
             task.add_done_callback(self._flush_task_done)
 
-        batch.timer = loop.call_later(self._debounce, _schedule_flush)
+        if self._debounce > 0:
+            batch.timer = loop.call_later(self._debounce, _schedule_flush)
+        else:
+            _schedule_flush()
 
-        await future
+        return future
 
     async def flush_all(self) -> None:
         """Flush every pending batch immediately, cancelling debounce timers.
@@ -182,12 +200,13 @@ class CommandCoalescer:
 
     def _get_or_create_batch(self, serial_number: str) -> _PendingBatch:
         """Return the pending batch for *serial_number*, creating one if needed."""
+        if self._debounce <= 0:
+            return _PendingBatch()
         if serial_number not in self._batches:
-            baseline = self._get_baseline_zones(serial_number)
-            self._batches[serial_number] = _PendingBatch(baseline)
+            self._batches[serial_number] = _PendingBatch()
         return self._batches[serial_number]
 
-    def _get_baseline_zones(self, serial_number: str) -> list[bool] | None:
+    def _get_current_zones(self, serial_number: str) -> list[bool] | None:
         """Snapshot the current ``EnabledZones`` from the state manager."""
         status = self._state_manager.get_status(serial_number)
         if status and status.user_aircon_settings:
@@ -201,21 +220,9 @@ class CommandCoalescer:
             if key == "type":
                 continue
 
-            if (
-                key == "UserAirconSettings.EnabledZones"
-                and isinstance(value, list)
-                and batch.baseline_zones is not None
-            ):
-                # Element-wise merge: diff this command's list against the
-                # baseline to discover which index(es) the caller changed,
-                # then record those as overrides.  Indices that match baseline
-                # are left alone — they represent stale reads from the same
-                # snapshot, NOT intentional reverts.  (Each concurrent caller
-                # reads the same stale baseline, mutates one index, and sends
-                # the full array back.)
-                for i, val in enumerate(value):
-                    if i < len(batch.baseline_zones) and val != batch.baseline_zones[i]:
-                        batch.zone_overrides[i] = val
+            if key == "UserAirconSettings.EnabledZones" and isinstance(value, list):
+                batch.zone_replacement = list(value)
+                batch.zone_overrides.clear()
             else:
                 # Scalar / non-list keys: last-write-wins
                 batch.merged_command[key] = value
@@ -225,22 +232,19 @@ class CommandCoalescer:
         batch = self._batches.pop(serial_number, None)
         if batch is None:
             return
+        if batch.timer is not None:
+            batch.timer.cancel()
+        await self._flush_batch(serial_number, batch)
 
-        # Build the final command dict
-        final_inner: dict[str, Any] = dict(batch.merged_command)
-
-        # Apply per-index zone overrides
-        if batch.zone_overrides and batch.baseline_zones is not None:
-            final_zones = list(batch.baseline_zones)
-            for idx, val in batch.zone_overrides.items():
-                if idx < len(final_zones):
-                    final_zones[idx] = val
-            final_inner["UserAirconSettings.EnabledZones"] = final_zones
-
-        merged_command: dict[str, Any] = {"command": final_inner}
-
+    async def _flush_batch(self, serial_number: str, batch: _PendingBatch) -> None:
+        """Deliver a batch and resolve its callers after the local state update."""
         try:
-            await self._send_fn(serial_number, merged_command)
+            if batch.zone_replacement is not None or batch.zone_overrides:
+                lock = self._zone_locks.setdefault(serial_number, asyncio.Lock())
+                async with lock:
+                    await self._send_batch(serial_number, batch)
+            else:
+                await self._send_batch(serial_number, batch)
         except BaseException as exc:
             for future in batch.futures:
                 if not future.done():
@@ -252,6 +256,24 @@ class CommandCoalescer:
         for future in batch.futures:
             if not future.done():
                 future.set_result(None)
+
+    async def _send_batch(self, serial_number: str, batch: _PendingBatch) -> None:
+        """Construct the payload from current state and deliver it."""
+        final_inner = dict(batch.merged_command)
+        if batch.zone_replacement is not None or batch.zone_overrides:
+            final_zones = (
+                list(batch.zone_replacement)
+                if batch.zone_replacement is not None
+                else self._get_current_zones(serial_number)
+            )
+            if final_zones is None:
+                raise ValueError("No enabled zones available to determine current zones")
+            for idx, val in batch.zone_overrides.items():
+                if not 0 <= idx < len(final_zones):
+                    raise ValueError(f"Zone index {idx} out of range for zones list")
+                final_zones[idx] = val
+            final_inner["UserAirconSettings.EnabledZones"] = final_zones
+        await self._send_fn(serial_number, {"command": final_inner})
 
 
 class ActronAirAPI:
@@ -1438,7 +1460,8 @@ class ActronAirAPI:
     async def get_ac_status(self, serial_number: str) -> ActronAirStatus:
         """Retrieve the current status for a specific AC system.
 
-        This replaces the events API which was disabled by Actron in July 2025.
+        A successful fetch updates the authoritative cache and notifies state
+        observers once before returning the cached model.
 
         Args:
             serial_number: Serial number of the AC system
@@ -1459,8 +1482,7 @@ class ActronAirAPI:
 
         status_data = await self._make_request("get", endpoint)
         status = ActronAirStatus(serial_number=serial_number, **status_data)
-        status._api = self  # Set API reference for command execution
-        return status
+        return self.state_manager.process_status_update(serial_number, status)
 
     async def send_command(self, serial_number: str, command: dict[str, Any]) -> None:
         """Send a command to the specified AC system.
@@ -1468,6 +1490,10 @@ class ActronAirAPI:
         ``set-settings`` commands are routed through the :class:`CommandCoalescer`
         so that concurrent zone toggles are merged into a single API call.
         All other command types are sent immediately.
+
+        Full zone lists replace earlier zone intent in the batch. Later
+        zone-model commands override only their specified indices. With
+        coalescing disabled, each request is sent separately in system order.
 
         Args:
             serial_number: Serial number of the AC system
@@ -1480,10 +1506,29 @@ class ActronAirAPI:
         serial_number = serial_number.lower()
 
         inner = command.get("command", {})
-        if inner.get("type") == "set-settings" and self._coalescer.debounce_seconds > 0:
+        if inner.get("type") == "set-settings" and (
+            self._coalescer.debounce_seconds > 0 or "UserAirconSettings.EnabledZones" in inner
+        ):
             await self._coalescer.enqueue(serial_number, command)
         else:
             await self._send_command_direct(serial_number, command)
+
+    async def _send_zone_changes(self, status: ActronAirStatus, changes: dict[int, bool]) -> None:
+        """Queue explicit zone intent without constructing a full-state command."""
+        if not status.serial_number:
+            raise ValueError("No serial number available to send command")
+        serial_number = status.serial_number.lower()
+        current = self.state_manager.get_status(serial_number)
+        zones = (current or status).user_aircon_settings.enabled_zones
+        if not zones:
+            raise ValueError("No enabled zones available to determine current zones")
+        for zone_id in changes:
+            if not 0 <= zone_id < len(zones):
+                raise ValueError(f"Zone index {zone_id} out of range for zones list")
+        if current is None:
+            # Allow commands from manually attached status models to seed the cache.
+            self.state_manager.process_status_update(serial_number, status)
+        await self._coalescer.enqueue_zone_changes(serial_number, changes)
 
     async def _send_command_direct(self, serial_number: str, command: dict[str, Any]) -> None:
         """Send a command directly to the API without coalescing.
@@ -1566,11 +1611,7 @@ class ActronAirAPI:
             ActronAirAPIError: If API request fails
 
         """
-        # Get current status using the status/latest endpoint
-        status = await self.get_ac_status(serial_number)
-        if status is not None:
-            # Process and store the status via the state manager so observers are notified
-            self.state_manager.process_status_update(serial_number, status)
+        await self.get_ac_status(serial_number)
 
     @property
     def access_token(self) -> str | None:

@@ -5,6 +5,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from actron_neo_api import ActronAirStatus
+
 
 # Sample API Response Fixtures
 @pytest.fixture
@@ -179,6 +181,13 @@ def mock_api() -> Any:
         def __init__(self) -> None:
             self.last_command: Any = None
             self.last_serial: Any = None
+            self.last_zone_changes: dict[int, bool] | None = None
+
+        async def _send_zone_changes(
+            self, status: ActronAirStatus, changes: dict[int, bool]
+        ) -> None:
+            self.last_serial = status.serial_number
+            self.last_zone_changes = changes
 
         async def send_command(self, serial_number: str, command: Dict[str, Any]) -> Dict[str, Any]:
             self.last_serial = serial_number

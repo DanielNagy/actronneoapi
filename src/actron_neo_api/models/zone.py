@@ -413,8 +413,9 @@ class ActronAirZone(BaseModel):
             is_enabled: True to enable, False to disable
 
         """
-        command = self._set_enable_command(is_enabled)
         if self.parent_status.api and self.parent_status.serial_number:
-            await self.parent_status.api.send_command(self.parent_status.serial_number, command)
+            await self.parent_status.api._send_zone_changes(
+                self.parent_status, {self.zone_id: is_enabled}
+            )
         else:
             raise ValueError("No API reference available to send command")

@@ -52,7 +52,7 @@ class TestCoalescerFlushEdgeCases:
         # Manually create a batch with a future
         loop = asyncio.get_running_loop()
         future: asyncio.Future[None] = loop.create_future()
-        batch = _PendingBatch(baseline_zones=None)
+        batch = _PendingBatch()
         batch.merged_command = {"type": "set-settings", "key": "value"}
         batch.futures.append(future)
         coalescer._batches["serial1"] = batch

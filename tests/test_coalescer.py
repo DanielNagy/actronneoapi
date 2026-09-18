@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable, Coroutine
+from functools import partial
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -80,15 +82,10 @@ class TestCommandCoalescer:
         sm = _state_manager_with_zones("abc", [True, True, True, True])
         coalescer = CommandCoalescer(send_fn, sm, debounce_seconds=0.05)
 
-        # Simulate 3 concurrent zone disable commands (stale-read scenario)
-        cmd0 = _make_zone_command([False, True, True, True])  # zone 0 off
-        cmd1 = _make_zone_command([True, False, True, True])  # zone 1 off
-        cmd2 = _make_zone_command([True, True, False, True])  # zone 2 off
-
         await asyncio.gather(
-            coalescer.enqueue("abc", cmd0),
-            coalescer.enqueue("abc", cmd1),
-            coalescer.enqueue("abc", cmd2),
+            coalescer.enqueue_zone_changes("abc", {0: False}),
+            coalescer.enqueue_zone_changes("abc", {1: False}),
+            coalescer.enqueue_zone_changes("abc", {2: False}),
         )
 
         # Only ONE API call should have been made
@@ -270,34 +267,23 @@ class TestCommandCoalescer:
 
         send_fn.assert_called_once()
         sent = send_fn.call_args[0][1]["command"]
-        assert sent["UserAirconSettings.EnabledZones"] == [False, False, True, True]
+        assert sent["UserAirconSettings.EnabledZones"] == [True, False, True, True]
 
     @pytest.mark.asyncio
-    async def test_stale_reads_dont_erase_prior_overrides(self) -> None:
-        """Stale-read indices matching baseline don't clear prior overrides.
-
-        Each concurrent caller reads the same stale baseline, changes one
-        index, and sends the full array.  Indices that match baseline in a
-        later command should NOT erase overrides recorded by earlier commands.
-        """
+    async def test_later_full_array_replaces_previous_array(self) -> None:
+        """Full arrays replace earlier values even when restoring the original state."""
         send_fn = AsyncMock()
         sm = _state_manager_with_zones("abc", [True, True, True, True])
         coalescer = CommandCoalescer(send_fn, sm, debounce_seconds=0.05)
 
-        # cmd0 disables zone 0; zone 1 is stale (matches baseline)
-        cmd0 = _make_zone_command([False, True, True, True])
-        # cmd1 disables zone 1; zone 0 is stale (matches baseline)
-        cmd1 = _make_zone_command([True, False, True, True])
-
         await asyncio.gather(
-            coalescer.enqueue("abc", cmd0),
-            coalescer.enqueue("abc", cmd1),
+            coalescer.enqueue("abc", _make_zone_command([False, True, True, True])),
+            coalescer.enqueue("abc", _make_zone_command([True, False, True, True])),
         )
 
         send_fn.assert_called_once()
         sent = send_fn.call_args[0][1]["command"]
-        # Both overrides must survive — stale reads don't erase them
-        assert sent["UserAirconSettings.EnabledZones"] == [False, False, True, True]
+        assert sent["UserAirconSettings.EnabledZones"] == [True, False, True, True]
 
 
 class TestCommandCoalescerTaskTracking:
@@ -449,14 +435,14 @@ class TestActronAirAPISendCommandCoalescing:
             mock_session.request.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_concurrent_zone_toggles_end_to_end(
+    async def test_concurrent_full_arrays_end_to_end(
         self,
         mock_oauth: MagicMock,
         mock_aiohttp_response: Any,
         sample_system_neo: dict[str, Any],
         sample_status_full: dict[str, Any],
     ) -> None:
-        """End-to-end test: concurrent zone toggles produce single API call."""
+        """Concurrent full arrays send the last complete replacement once."""
         api = ActronAirAPI(debounce_seconds=0.05)
         api.oauth2_auth = mock_oauth
         api._initialized = True
@@ -488,11 +474,11 @@ class TestActronAirAPISendCommandCoalescing:
         # Only ONE API call
         assert mock_session.request.call_count == 1
 
-        # Verify merged EnabledZones: zone 0→False, zone 1→True, rest unchanged
+        # The later complete array restores zone 0 and enables zone 1.
         call_kwargs = mock_session.request.call_args
         sent_json = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
         assert sent_json["command"]["UserAirconSettings.EnabledZones"] == [
-            False,
+            True,
             True,
             True,
             False,
@@ -501,3 +487,77 @@ class TestActronAirAPISendCommandCoalescing:
             False,
             False,
         ]
+
+
+@pytest.mark.parametrize(
+    ("operations", "expected"),
+    [
+        pytest.param(
+            (
+                partial(
+                    CommandCoalescer.enqueue,
+                    serial_number="abc",
+                    command=_make_zone_command([True, False]),
+                ),
+                partial(
+                    CommandCoalescer.enqueue_zone_changes, serial_number="abc", changes={1: True}
+                ),
+            ),
+            [True, True],
+            id="replacement-then-explicit",
+        ),
+        pytest.param(
+            (
+                partial(
+                    CommandCoalescer.enqueue_zone_changes, serial_number="abc", changes={1: True}
+                ),
+                partial(
+                    CommandCoalescer.enqueue,
+                    serial_number="abc",
+                    command=_make_zone_command([True, False]),
+                ),
+            ),
+            [True, False],
+            id="explicit-then-replacement",
+        ),
+        pytest.param(
+            (
+                partial(
+                    CommandCoalescer.enqueue,
+                    serial_number="abc",
+                    command=_make_zone_command([True, False]),
+                ),
+                partial(
+                    CommandCoalescer.enqueue_zone_changes, serial_number="abc", changes={1: True}
+                ),
+                partial(
+                    CommandCoalescer.enqueue,
+                    serial_number="abc",
+                    command=_make_zone_command([False, False]),
+                ),
+                partial(
+                    CommandCoalescer.enqueue_zone_changes, serial_number="abc", changes={0: True}
+                ),
+            ),
+            [True, False],
+            id="replacement-explicit-replacement-explicit",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_replacements_and_explicit_changes_follow_arrival_order(
+    operations: tuple[Callable[[CommandCoalescer], Coroutine[None, None, None]], ...],
+    expected: list[bool],
+) -> None:
+    """A replacement resets zone intent; only later explicit changes survive."""
+    send_fn = AsyncMock()
+    coalescer = CommandCoalescer(send_fn, StateManager(), debounce_seconds=3600)
+    tasks = []
+    for operation in operations:
+        tasks.append(asyncio.create_task(operation(coalescer)))
+        await asyncio.sleep(0)
+
+    await coalescer.flush_all()
+    await asyncio.gather(*tasks)
+
+    send_fn.assert_awaited_once_with("abc", _make_zone_command(expected))

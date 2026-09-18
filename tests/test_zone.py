@@ -150,9 +150,7 @@ class TestZoneAsyncEnable:
 
         assert result is None  # Commands return None on success
         assert mock_api.last_serial == "TEST123"
-        assert mock_api.last_command["command"]["type"] == "set-settings"
-        # Zone 0 should be enabled (True)
-        assert mock_api.last_command["command"]["UserAirconSettings.EnabledZones"][0] is True
+        assert mock_api.last_zone_changes == {0: True}
 
     @pytest.mark.asyncio
     async def test_disable_zone_with_api(self, zone_with_api: ActronAirZone, mock_api: Any) -> None:
@@ -161,8 +159,7 @@ class TestZoneAsyncEnable:
 
         assert result is None  # Commands return None on success
         assert mock_api.last_serial == "TEST123"
-        # Zone 0 should be disabled (False)
-        assert mock_api.last_command["command"]["UserAirconSettings.EnabledZones"][0] is False
+        assert mock_api.last_zone_changes == {0: False}
 
     @pytest.mark.asyncio
     async def test_enable_without_api(self, zone_without_api: ActronAirZone) -> None:
@@ -234,6 +231,11 @@ class TestZoneOptimisticStateNotUpdatedOnError:
         """Create zone with an API that raises on send_command."""
 
         class FailingAPI:
+            async def _send_zone_changes(
+                self, status: ActronAirStatus, changes: dict[int, bool]
+            ) -> None:
+                raise ActronAirAPIError("API error")
+
             async def send_command(self, serial_number: str, command: dict[str, Any]) -> None:
                 raise ActronAirAPIError("API error")
 
